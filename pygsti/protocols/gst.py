@@ -2084,6 +2084,17 @@ def _add_gauge_opt(results, base_est_label, gaugeopt_suite_or_gsdict, starting_m
     printer = _baseobjs.VerbosityPrinter.create_printer(verbosity, comm)
 
     #Get gauge optimization dictionary
+    #
+    #   Riley note: it helped me write the leakage experiment notebooks
+    #   if I expanded the role of the "gaugeopt_suite" argument to 
+    #   "gaugeopt_suite_or_gsdict". The expansion seemed reasonable
+    #   in light of the docstring description for gaugeopt_suite.
+    #   But, at the end of the day, it's probably better for me to go
+    #   back and edit those notebooks to avoid calling what's clearly
+    #   a private function. While I'm at it I should update the docstring
+    #   for this function (which incorrectly states that gaugeopt_suite
+    #   can be anything castable to a GaugeoptSuite).
+    #
     if isinstance(gaugeopt_suite_or_gsdict, dict):
         gaugeopt_suite_dict = gaugeopt_suite_or_gsdict
     else:
@@ -2456,6 +2467,9 @@ def _compute_1d_reference_values_and_name(estimate, badfit_options, gaugeopt_sui
                 spamdd[key] = 0.5 * _tools.optools.povm_diamonddist(gaugeopt_model, target_model, key)
 
             dd[lbl]['SPAM'] = sum(spamdd.values())
+            #  Riley note: this PR is adding the two lines below, but I wasn't the one who originally
+            #  added them. I inherited these additions from notes in a README that Corey supplied very
+            #  early in my leakage work.
             for k,v in spamdd.items():
                 dd[lbl][k] = v
 
