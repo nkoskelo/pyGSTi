@@ -502,7 +502,7 @@ class LindbladErrorgen(_LinearOperator):
             for blk in lindblad_coefficient_blocks]
 
         #combine all of the linblad term superoperators across the blocks to a single concatenated tensor.
-        self.combined_lindblad_term_superops = _np.concatenate([Lterm_superops for (Lterm_superops, _) in self.lindblad_term_superops_and_1norms], axis=0)
+        self._combined_lindblad_term_superops = _np.concatenate([Lterm_superops for (Lterm_superops, _) in self.lindblad_term_superops_and_1norms], axis=0)
 
         #Create a representation of the type chosen above:
         if self._rep_type == 'lindblad errorgen':
@@ -539,6 +539,17 @@ class LindbladErrorgen(_LinearOperator):
         assert(self._onenorm_upbound is not None)  # _update_rep should set this
 
         # Done with __init__(...)
+
+    """
+    TODO: remove this before merging the PR. It's needed because I was foolish and pickled results
+    instead of writing them as JSON. Once this function is removed, drop the underscore from
+    _combined_lindblas_term_superops.
+    """
+    @property
+    def combined_lindblad_term_superops(self):
+        if not hasattr(self, '_combined_lindblas_term_superops'):
+            self._combined_lindblad_term_superops = _np.concatenate([Lterm_superops for (Lterm_superops, _) in self.lindblad_term_superops_and_1norms], axis=0)
+        return self._combined_lindblad_term_superops
 
     def _init_terms(self, coefficient_blocks, max_polynomial_vars):
 
