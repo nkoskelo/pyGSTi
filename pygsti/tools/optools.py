@@ -275,6 +275,11 @@ def tracedist(a, b):
     """
     return 0.5 * tracenorm(a - b)
 
+"""
+TODO: make versions of diamonddist that compute distance to leakage-free or seepage-free CPTP operators.
+Use _sdps.diamond_norm_canon.
+"""
+
 
 def diamonddist(a, b, mx_basis='pp', return_x=False, return_all_vars=False):
     """
@@ -321,7 +326,7 @@ def diamonddist(a, b, mx_basis='pp', return_x=False, return_all_vars=False):
     prob, vars = _sdps.diamond_norm_model_jamiolkowski(J)
 
     try:
-        prob.solve(solver='CVXOPT')
+        prob.solve(solver='MOSEK')
         objective_val = prob.value
         varvals = [v.value for v in vars]
     except Exception as e:
@@ -617,6 +622,25 @@ def leading_dxd_submatrix_basis_vectors(d: int, n: int, current_basis, return_la
         return submatrix_basis_vectors, basis_labels
     if not return_labels:
         return submatrix_basis_vectors
+
+def diamonddist_projection(
+        superop, basis, leakfree=False, seepfree=False, n_leak=0, cptp=True, subspace_diamond=False,
+        return_optvars=False, verbose=False
+    ):
+    prob, projection, solvers = _sdps.diamond_norm_projection_model(superop, basis, leakfree, seepfree, n_leak, cptp, subspace_diamond)
+    objective_val = -2
+    optvars = []
+    for solver in solvers:
+        try:
+            prob.solve(solver=solver, verbose=verbose)
+            objective_val = prob.value
+            optvars.append(projection.value)
+            optvars.extend(v.value for v in prob.variables())
+            return (objective_val, optvars) if return_optvars else objective_val
+        except Exception as e:
+            _warnings.warn(f"Running CVXPY with solver {solver} failed with message {str(e)}.")
+    _warnings.warn(f"All numerical solvers failed; returning -2!")
+    return (objective_val, optvars) if return_optvars else objective_val
 
 
 def subspace_restricted_fro_dist(a, b, mx_basis, n_leak=0):
