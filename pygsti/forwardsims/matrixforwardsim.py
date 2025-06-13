@@ -31,6 +31,13 @@ from pygsti.tools import slicetools as _slct
 from pygsti.tools.matrixtools import _fas
 from pygsti.tools import listtools as _lt
 from pygsti.circuits import CircuitList as _CircuitList
+from pygsti.baseobjs.label import (LabelTup, LabelTupTup)
+from pygsti.modelmembers.operations.composedop import ComposedOp
+from pygsti.tools.internalgates import internal_gate_unitaries
+from pygsti.tools import unitary_to_superop
+
+import dask.array as da
+
 
 _dummy_profiler = _DummyProfiler()
 
@@ -95,7 +102,8 @@ class SimpleMatrixForwardSimulator(_ForwardSimulator):
                 scale_exp += ex   # scale and keep track of exponent
                 if H.max() < _PSMALL and H.min() > -_PSMALL:
                     nG = max(_nla.norm(G), _np.exp(-scale_exp))
-                    G = _np.dot(gate, G / nG); scale_exp += _np.log(nG)  # LEXICOGRAPHICAL VS MATRIX ORDER
+                    G = _np.dot(gate, G / nG)
+                    scale_exp += _np.log(nG)  # LEXICOGRAPHICAL VS MATRIX ORDER
                 else: G = H
 
             old_err = _np.seterr(over='ignore')
@@ -2103,3 +2111,148 @@ class MatrixForwardSimulator(_DistributableForwardSimulator, SimpleMatrixForward
                                                   layout.resource_alloc())
         return self._bulk_fill_timedep_dobjfn(raw_obj, array_to_fill, layout, ds_circuits, num_total_outcomes,
                                               dataset, ds_cache)
+
+
+class TensorProdMatrixForwardSimulator(SimpleMatrixForwardSimulator):
+    """
+    A forward simulator that uses matrix-matrix products to compute circuit outcome probabilities.
+
+    This is "simple" in that it adds a minimal implementation to its :class:`ForwardSimulator`
+    base class.  Because of this, it lacks some of the efficiency of a :class:`MatrixForwardSimulator`
+    object, and is mainly useful as a reference implementation and check for other simulators.
+    """
+    # NOTE: It is currently not a *distributed* forward simulator, but after the addition of
+    # the `as_layout` method to distributed atoms, this class could instead derive from
+    # DistributableForwardSimulator and (I think) not need any more implementation.
+    # If this is done, then MatrixForwardSimulator wouldn't need to separately subclass DistributableForwardSimulator
+
+    def __init__(self, model=None):
+        super().__init__(model=model)
+
+        self.swap_gate_superop = da.from_array(unitary_to_superop(internal_gate_unitaries()["SWAP"]))
+    
+    def product(self, circuit, scale=False):
+        """
+        Compute the product of a specified sequence of operation labels.
+
+        Note: LinearOperator matrices are multiplied in the reversed order of the tuple. That is,
+        the first element of circuit can be thought of as the first gate operation
+        performed, which is on the far right of the product of matrices.
+
+        Parameters
+        ----------
+        circuit : Circuit or tuple of operation labels
+            The sequence of operation labels.
+
+        scale : bool, optional
+            When True, return a scaling factor (see below).
+
+        Returns
+        -------
+        product : numpy array
+            The product or scaled product of the operation matrices.
+        scale : float
+            Only returned when scale == True, in which case the
+            actual product == product * scale.  The purpose of this
+            is to allow a trace or other linear operation to be done
+            prior to the scaling.
+        """
+        # First we need to compute the lanes.
+
+        # We assume that the geometry is a line. Therefore, you must work with neighboring qubits to reach the subsequent qubits.
+
+        qubits_to_potentially_entangled_others = {i: set((i,)) for i in range(self.model.state_space.num_qubits)}
+        for layer in circuit:
+            if isinstance(layer, LabelTupTup):
+                for op in layer:
+                    qubits_used = op.qubits
+                    for qb in qubits_used:
+                        qubits_to_potentially_entangled_others[qb].update(set(qubits_used))
+
+                # We need to iterate over it.
+            elif isinstance(layer, LabelTup):
+                # We can just use the label itself.
+                qubits_used = layer.qubits
+                for qb in qubits_used:
+                    qubits_to_potentially_entangled_others[qb].update(set(qubits_used))
+
+        lanes = {}
+        lan_num = 0
+        visited: dict[int, int] = {}
+        # Find which qubits are reachable from each of the starting points.
+        def reachable_nodes(starting_point: int, graph_qubits_to_neighbors: dict[int, set[int]], visited: dict[int, set[int]]):
+
+            if starting_point in visited:
+                return visited[starting_point]
+            else:
+                assert starting_point in graph_qubits_to_neighbors
+                visited[starting_point] = graph_qubits_to_neighbors[starting_point]
+                output = set(visited[starting_point])
+                for child in graph_qubits_to_neighbors[starting_point]:
+                    if child != starting_point:
+                        output.update(output, reachable_nodes(child, graph_qubits_to_neighbors, visited))
+                visited[starting_point] = output
+                return output
+
+        available_starting_points = list(sorted(qubits_to_potentially_entangled_others.keys()))
+        while available_starting_points:
+            sp = available_starting_points[0]
+            nodes = reachable_nodes(sp, qubits_to_potentially_entangled_others, visited)
+            for node in nodes:
+                available_starting_points.remove(node)
+            lanes[lan_num] = nodes
+            lan_num += 1
+
+
+        base_products = [da.from_array(_np.identity(4**len(val))) for _, val in lanes.items()]
+        for layer in circuit:
+            composed = self.model.circuit_layer_operator(layer, "op")
+            factors = composed.factorops
+            # Assume that we are going to start from the qubit 0 every time.
+            total_matrix_for_a_lane = 1
+            qubits_used = 0
+            lane = 0
+            qubits_available = len(lanes[lane])
+            for ind, factor in enumerate(factors):
+                my_matrix = da.from_array(factor.submembers()[0].to_dense(on_space="HilbertSchmidt"))
+                num_qubits_used = _np.log(len(my_matrix)) / _np.log(4) # shape should be a (4^n, 4^n)
+                # We need to check if we need to swap the qubit ordering.
+                if num_qubits_used > 2:
+                    raise AssertionError("Gate has too many qubits at this time")
+                elif num_qubits_used == 2:
+                    swap_please: bool = False
+                    if isinstance(layer, LabelTupTup):
+                        swap_please = (layer[ind].qubits[0] > layer[ind].qubits[1])
+                    elif isinstance(layer, LabelTup):
+                        swap_please = (layer.qubits[0] > layer.qubits[1])
+                    if swap_please:
+                        my_matrix = self.swap_gate_superop.T @ my_matrix @ self.swap_gate_superop
+                    
+                if qubits_used + num_qubits_used > qubits_available:
+                    # We are out of the lane.
+                    print(total_matrix_for_a_lane.shape)
+                    print(base_products[lane].shape)
+                    base_products[lane] =  total_matrix_for_a_lane @ base_products[lane]
+                    lane += 1
+                    qubits_used = num_qubits_used
+                    # Assumed to not be split across a lane boundary.
+                    qubits_available = len(lanes[lane])
+                    total_matrix_for_a_lane = my_matrix
+                else:
+                    # We are still in the lane and need to expand the remaining matrix by the Kronecker product.
+                    total_matrix_for_a_lane = da.tensordot(total_matrix_for_a_lane, my_matrix, axes=0) # axis=0 gives the tensor product.
+                    if len(total_matrix_for_a_lane.shape) > 2:
+                        total_matrix_for_a_lane = total_matrix_for_a_lane.reshape(total_matrix_for_a_lane.shape[0]*total_matrix_for_a_lane.shape[2], total_matrix_for_a_lane.shape[1]*total_matrix_for_a_lane.shape[3])
+                    qubits_used += num_qubits_used
+            # Multiply in the final lane.
+            base_products[lane] =  total_matrix_for_a_lane @ base_products[lane]
+    
+        G = 1
+        for lane in lanes:
+            G = da.tensordot(G, base_products[lane], axes=0)
+
+        total_size = sum([len(lanes[key]) for key in lanes])
+
+        return G.reshape((4**total_size, 4**total_size)).compute()
+
+
